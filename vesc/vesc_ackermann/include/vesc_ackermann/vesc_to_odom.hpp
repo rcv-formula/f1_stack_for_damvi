@@ -31,21 +31,21 @@
 #ifndef VESC_ACKERMANN__VESC_TO_ODOM_HPP_
 #define VESC_ACKERMANN__VESC_TO_ODOM_HPP_
 
-#include <tf2_ros/transform_broadcaster.h>
-
+#include <deque>
 #include <memory>
 #include <string>
 
+#include <geometry_msgs/msg/quaternion.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
-#include <std_msgs/msg/float64.hpp>
+#include <sensor_msgs/msg/imu.hpp>
 #include <vesc_msgs/msg/vesc_state_stamped.hpp>
+#include <tf2_ros/transform_broadcaster.h>
 
 namespace vesc_ackermann
 {
 
 using nav_msgs::msg::Odometry;
-using std_msgs::msg::Float64;
 using vesc_msgs::msg::VescStateStamped;
 
 class VescToOdom : public rclcpp::Node
@@ -57,29 +57,28 @@ private:
   // ROS parameters
   std::string odom_frame_;
   std::string base_frame_;
-  /** State message does not report servo position, so use the command instead */
-  bool use_servo_cmd_;
-  // conversion gain and offset
   double speed_to_erpm_gain_, speed_to_erpm_offset_;
-  double steering_to_servo_gain_, steering_to_servo_offset_;
   double wheelbase_;
   bool publish_tf_;
 
   // odometry state
   double x_, y_, yaw_;
-  Float64::SharedPtr last_servo_cmd_;  ///< Last servo position commanded value
-  Float64::SharedPtr init_servo_pose_;
+  geometry_msgs::msg::Quaternion last_orientation_;
+  bool has_orientation_;
+  bool has_previous_imu_;
   VescStateStamped::SharedPtr last_state_;  ///< Last received state message
+  sensor_msgs::msg::Imu previous_imu_;
+  std::deque<sensor_msgs::msg::Imu> imu_buffer_;
 
   // ROS services
   rclcpp::Publisher<Odometry>::SharedPtr odom_pub_;
   rclcpp::Subscription<VescStateStamped>::SharedPtr vesc_state_sub_;
-  rclcpp::Subscription<Float64>::SharedPtr servo_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_pub_;
 
   // ROS callbacks
   void vescStateCallback(const VescStateStamped::SharedPtr state);
-  void servoCmdCallback(const Float64::SharedPtr servo);
+  void imuCallback(const sensor_msgs::msg::Imu::SharedPtr imu);
 };
 
 }  // namespace vesc_ackermann

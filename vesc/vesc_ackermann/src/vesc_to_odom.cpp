@@ -32,8 +32,13 @@
 
 #include <cmath>
 #include <string>
+#include <vector>
 
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <rclcpp/qos.hpp>
+#include <tf2/LinearMath/Matrix3x3.h>
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <vesc_msgs/msg/vesc_state_stamped.hpp>
 
 namespace vesc_ackermann
@@ -42,34 +47,40 @@ namespace vesc_ackermann
 using geometry_msgs::msg::TransformStamped;
 using nav_msgs::msg::Odometry;
 using std::placeholders::_1;
-using std_msgs::msg::Float64;
+using sensor_msgs::msg::Imu;
 using vesc_msgs::msg::VescStateStamped;
+
+namespace
+{
+
+double yawFromQuaternion(const geometry_msgs::msg::Quaternion & q)
+{
+  tf2::Quaternion tf_q(q.x, q.y, q.z, q.w);
+  double roll, pitch, yaw;
+  tf2::Matrix3x3(tf_q).getRPY(roll, pitch, yaw);
+  return yaw;
+}
+
+}  // namespace
 
 VescToOdom::VescToOdom(const rclcpp::NodeOptions & options)
 : Node("vesc_to_odom_node", options),
   odom_frame_("odom"),
   base_frame_("base_link"),
-  use_servo_cmd_(true),
   publish_tf_(true),
   x_(0.0),
   y_(0.0),
-  yaw_(0.0)
+  yaw_(0.0),
+  has_orientation_(false),
+  has_previous_imu_(false)
 {
   // get ROS parameters
   odom_frame_ = declare_parameter("odom_frame", odom_frame_);
   base_frame_ = declare_parameter("base_frame", base_frame_);
-  use_servo_cmd_ = declare_parameter("use_servo_cmd_to_calc_angular_velocity", use_servo_cmd_);
 
   speed_to_erpm_gain_ = declare_parameter<double>("speed_to_erpm_gain");
   speed_to_erpm_offset_ = declare_parameter<double>("speed_to_erpm_offset");
-
-  if (use_servo_cmd_) {
-    steering_to_servo_gain_ =
-      declare_parameter<double>("steering_angle_to_servo_gain");
-    steering_to_servo_offset_ =
-      declare_parameter<double>("steering_angle_to_servo_offset");
-    wheelbase_ = declare_parameter<double>("wheelbase");
-  }
+  wheelbase_ = declare_parameter<double>("wheelbase");
 
   publish_tf_ = declare_parameter("publish_tf", publish_tf_);
 
@@ -81,36 +92,23 @@ VescToOdom::VescToOdom(const rclcpp::NodeOptions & options)
     tf_pub_.reset(new tf2_ros::TransformBroadcaster(this));
   }
 
-  // subscribe to vesc state and. optionally, servo command
+  // subscribe to vesc state and IMU orientation feedback
   vesc_state_sub_ = create_subscription<VescStateStamped>(
     "sensors/core", 10, std::bind(&VescToOdom::vescStateCallback, this, _1));
 
-  if (use_servo_cmd_) {
-    servo_sub_ = create_subscription<Float64>(
-      "sensors/servo_position_command", 10, std::bind(&VescToOdom::servoCmdCallback, this, _1));
-  }
-  init_servo_pose_ = std::make_shared<std_msgs::msg::Float64>();
-  init_servo_pose_->data=0.5;
-  last_servo_cmd_ = init_servo_pose_;
+  imu_sub_ = create_subscription<Imu>(
+    "/imu_data", rclcpp::SensorDataQoS(),
+    std::bind(&VescToOdom::imuCallback, this, _1));
+
+  last_orientation_.w = 1.0;
 }
 
 void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
 {
-  // check that we have a last servo command if we are depending on it for angular velocity
-  if (use_servo_cmd_ && !last_servo_cmd_) {
-    return;
-  }
-
   // convert to engineering units
   double current_speed = (state->state.speed - speed_to_erpm_offset_) / speed_to_erpm_gain_;
   if (std::fabs(current_speed) < 0.05) {
     current_speed = 0.0;
-  }
-  double current_steering_angle(0.0), current_angular_velocity(0.0);
-  if (use_servo_cmd_) {
-    current_steering_angle =
-      (last_servo_cmd_->data - steering_to_servo_offset_) / steering_to_servo_gain_;
-    current_angular_velocity = current_speed * tan(current_steering_angle) / wheelbase_;
   }
 
   // use current state as last state if this is our first time here
@@ -118,19 +116,129 @@ void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
     last_state_ = state;
   }
 
-  // calc elapsed time
-  auto dt = rclcpp::Time(state->header.stamp) - rclcpp::Time(last_state_->header.stamp);
+  rclcpp::Time state_time(state->header.stamp);
 
-  /** @todo could probably do better propigating odometry, e.g. trapezoidal integration */
-
-  // propigate odometry
-  double x_dot = current_speed * cos(yaw_);
-  double y_dot = current_speed * sin(yaw_);
-  x_ += x_dot * dt.seconds();
-  y_ += y_dot * dt.seconds();
-  if (use_servo_cmd_) {
-    yaw_ += current_angular_velocity * dt.seconds();
+  if (!has_previous_imu_) {
+    while (!imu_buffer_.empty() && rclcpp::Time(imu_buffer_.front().header.stamp) <= state_time) {
+      previous_imu_ = imu_buffer_.front();
+      imu_buffer_.pop_front();
+      has_previous_imu_ = true;
+      break;
+    }
+    if (!has_previous_imu_) {
+      last_state_ = state;
+      return;
+    }
   }
+
+  std::vector<Imu> processed_imus;
+  processed_imus.reserve(imu_buffer_.size() + 1);
+  if (has_previous_imu_) {
+    processed_imus.push_back(previous_imu_);
+  }
+
+  while (!imu_buffer_.empty() && rclcpp::Time(imu_buffer_.front().header.stamp) <= state_time) {
+    processed_imus.push_back(imu_buffer_.front());
+    previous_imu_ = imu_buffer_.front();
+    imu_buffer_.pop_front();
+    has_previous_imu_ = true;
+  }
+
+  if (processed_imus.empty()) {
+    last_state_ = state;
+    return;
+  }
+
+  auto normalize_angle = [](double angle) {
+    return std::atan2(std::sin(angle), std::cos(angle));
+  };
+
+  const double half_wheelbase = wheelbase_ * 0.5;
+  auto compute_beta = [&](double steering_angle) {
+    if (wheelbase_ <= 1e-6) {
+      return 0.0;
+    }
+    return std::atan(std::tan(steering_angle) * (half_wheelbase / wheelbase_));
+  };
+
+  double delta_x = 0.0;
+  double delta_y = 0.0;
+  double body_vx_latest = current_speed;
+  double body_vy_latest = 0.0;
+
+  for (size_t i = 1; i < processed_imus.size(); ++i) {
+    const auto & prev = processed_imus[i - 1];
+    const auto & curr = processed_imus[i];
+    double sample_dt = (rclcpp::Time(curr.header.stamp) - rclcpp::Time(prev.header.stamp)).seconds();
+    if (sample_dt <= 0.0) {
+      continue;
+    }
+    double yaw_prev = yawFromQuaternion(prev.orientation);
+    double yaw_curr = yawFromQuaternion(curr.orientation);
+    double yaw_diff = normalize_angle(yaw_curr - yaw_prev);
+    double sample_yaw_rate = (sample_dt > 0.0) ? yaw_diff / sample_dt : 0.0;
+    double steering_angle = 0.0;
+    if (std::fabs(current_speed) > 1e-6) {
+      steering_angle = std::atan(wheelbase_ * sample_yaw_rate / current_speed);
+    }
+    double beta = compute_beta(steering_angle);
+    double body_vx = current_speed * std::cos(beta);
+    double body_vy = current_speed * std::sin(beta);
+    double world_vx =
+      body_vx * std::cos(yaw_curr) - body_vy * std::sin(yaw_curr);
+    double world_vy =
+      body_vx * std::sin(yaw_curr) + body_vy * std::cos(yaw_curr);
+    delta_x += world_vx * sample_dt;
+    delta_y += world_vy * sample_dt;
+    body_vx_latest = body_vx;
+    body_vy_latest = body_vy;
+  }
+
+  const auto & latest_sample = processed_imus.back();
+  double latest_yaw = yawFromQuaternion(latest_sample.orientation);
+  double tail_dt = (state_time - rclcpp::Time(latest_sample.header.stamp)).seconds();
+
+  double current_angular_velocity = 0.0;
+  if (processed_imus.size() >= 2) {
+    double yaw_start = yawFromQuaternion(processed_imus.front().orientation);
+    double yaw_end = yawFromQuaternion(latest_sample.orientation);
+    double yaw_delta = normalize_angle(yaw_end - yaw_start);
+    double yaw_dt = (
+      rclcpp::Time(latest_sample.header.stamp) -
+      rclcpp::Time(processed_imus.front().header.stamp)).seconds();
+    if (yaw_dt > 0.0) {
+      current_angular_velocity = yaw_delta / yaw_dt;
+    }
+  }
+
+  if (tail_dt > 0.0) {
+    double yaw_rate_tail = (processed_imus.size() >= 2) ? current_angular_velocity : 0.0;
+    double steering_angle_tail = 0.0;
+    if (std::fabs(current_speed) > 1e-6) {
+      steering_angle_tail = std::atan(wheelbase_ * yaw_rate_tail / current_speed);
+    }
+    double beta_tail = compute_beta(steering_angle_tail);
+    double body_vx = current_speed * std::cos(beta_tail);
+    double body_vy = current_speed * std::sin(beta_tail);
+    double world_vx =
+      body_vx * std::cos(latest_yaw) - body_vy * std::sin(latest_yaw);
+    double world_vy =
+      body_vx * std::sin(latest_yaw) + body_vy * std::cos(latest_yaw);
+    delta_x += world_vx * tail_dt;
+    delta_y += world_vy * tail_dt;
+    body_vx_latest = body_vx;
+    body_vy_latest = body_vy;
+  }
+
+  x_ += delta_x;
+  y_ += delta_y;
+  yaw_ = latest_yaw;
+  last_orientation_ = latest_sample.orientation;
+  has_orientation_ = true;
+
+  previous_imu_.orientation = last_orientation_;
+  previous_imu_.header.stamp = state->header.stamp;
+  has_previous_imu_ = true;
 
   // save state for next time
   last_state_ = state;
@@ -144,10 +252,14 @@ void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
   // Position
   odom.pose.pose.position.x = x_;
   odom.pose.pose.position.y = y_;
-  odom.pose.pose.orientation.x = 0.0;
-  odom.pose.pose.orientation.y = 0.0;
-  odom.pose.pose.orientation.z = sin(yaw_ / 2.0);
-  odom.pose.pose.orientation.w = cos(yaw_ / 2.0);
+  if (has_orientation_) {
+    odom.pose.pose.orientation = last_orientation_;
+  } else {
+    odom.pose.pose.orientation.x = 0.0;
+    odom.pose.pose.orientation.y = 0.0;
+    odom.pose.pose.orientation.z = 0.0;
+    odom.pose.pose.orientation.w = 1.0;
+  }
 
   // Position uncertainty
   /** @todo Think about position uncertainty, perhaps get from parameters? */
@@ -156,8 +268,8 @@ void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
   odom.pose.covariance[35] = 0.4;  ///< yaw
 
   // Velocity ("in the coordinate frame given by the child_frame_id")
-  odom.twist.twist.linear.x = current_speed;
-  odom.twist.twist.linear.y = 0.0;
+  odom.twist.twist.linear.x = body_vx_latest;
+  odom.twist.twist.linear.y = body_vy_latest;
   odom.twist.twist.angular.z = current_angular_velocity;
 
   // Velocity uncertainty
@@ -183,9 +295,13 @@ void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
   }
 }
 
-void VescToOdom::servoCmdCallback(const Float64::SharedPtr servo)
+void VescToOdom::imuCallback(const Imu::SharedPtr imu)
 {
-  last_servo_cmd_ = servo;
+  imu_buffer_.push_back(*imu);
+  // keep buffer from growing unbounded
+  while (imu_buffer_.size() > 1000) {
+    imu_buffer_.pop_front();
+  }
 }
 
 }  // namespace vesc_ackermann

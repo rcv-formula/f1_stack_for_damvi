@@ -39,7 +39,6 @@ vesc_to_odom_node:
     use_servo_cmd_to_calc_angular_velocity: true
     # car wheelbase is about 25cm
     wheelbase: .2925
-
 # No longer needed, all parameters are shared
 # vesc_driver:
 #   ros__parameters:

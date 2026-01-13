@@ -50,7 +50,7 @@ class FramePublisher(Node):
         t_imu.child_frame_id = 'imu'
         t_imu.transform.translation.x = 0.27   # IMU의 X 위치 (예시값) 원래 0.2 였는데 laser랑 맞아야한다고 생각해서 0.27로 고정했음.
         t_imu.transform.translation.y = 0.0   # IMU의 Y 위치 (예시값)
-        t_imu.transform.translation.z = 0.1   # IMU의 Z 위치 (예시값)
+        t_imu.transform.translation.z = 0.06   # IMU의 Z 위치 (예시값) 원래 0.1 이었는데 imu 6cm 떨어져있어서 0.06으로 함
         t_imu.transform.rotation.x = 0.0      # IMU의 회전 (필요 시 수정)
         t_imu.transform.rotation.y = 0.0
         t_imu.transform.rotation.z = 0.0

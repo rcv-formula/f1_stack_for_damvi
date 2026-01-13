@@ -38,6 +38,7 @@
 #include <geometry_msgs/msg/quaternion.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp/node_interfaces/node_parameters_interface.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <vesc_msgs/msg/vesc_state_stamped.hpp>
 #include <tf2_ros/transform_broadcaster.h>
@@ -60,6 +61,7 @@ private:
   double speed_to_erpm_gain_, speed_to_erpm_offset_;
   double wheelbase_;
   bool publish_tf_;
+  bool use_simtime_;
 
   // odometry state
   double x_, y_, yaw_;
@@ -75,6 +77,7 @@ private:
   rclcpp::Subscription<VescStateStamped>::SharedPtr vesc_state_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_pub_;
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr parameter_callback_handle_;
 
   // ROS callbacks
   void vescStateCallback(const VescStateStamped::SharedPtr state);

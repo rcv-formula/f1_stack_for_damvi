@@ -68,6 +68,7 @@ VescToOdom::VescToOdom(const rclcpp::NodeOptions & options)
   odom_frame_("odom"),
   base_frame_("base_link"),
   publish_tf_(true),
+  use_simtime_(false),
   x_(0.0),
   y_(0.0),
   yaw_(0.0),
@@ -83,9 +84,22 @@ VescToOdom::VescToOdom(const rclcpp::NodeOptions & options)
   wheelbase_ = declare_parameter<double>("wheelbase");
 
   publish_tf_ = declare_parameter("publish_tf", publish_tf_);
+  // use_simtime_ = declare_parameter("use_sim_time", use_simtime_);
+
+  // parameter_callback_handle_ = add_on_set_parameters_callback(
+  //   [this](const std::vector<rclcpp::Parameter> & params) {
+  //     rcl_interfaces::msg::SetParametersResult result;
+  //     result.successful = true;
+  //     for (const auto & param : params) {
+  //       if (param.get_name() == "use_sim_time") {
+  //         use_simtime_ = param.as_bool();
+  //       }
+  //     }
+  //     return result;
+  //   });
 
   // create odom publisher
-  odom_pub_ = create_publisher<Odometry>("odom_wheel", 10);
+  odom_pub_ = create_publisher<Odometry>("odom_wheel_temp", 10);
 
   // create tf broadcaster
   if (publish_tf_) {
@@ -97,7 +111,7 @@ VescToOdom::VescToOdom(const rclcpp::NodeOptions & options)
     "sensors/core", 10, std::bind(&VescToOdom::vescStateCallback, this, _1));
 
   imu_sub_ = create_subscription<Imu>(
-    "/imu_data", rclcpp::SensorDataQoS(),
+    "/imu/data", rclcpp::SensorDataQoS(),
     std::bind(&VescToOdom::imuCallback, this, _1));
 
   last_orientation_.w = 1.0;
@@ -246,7 +260,11 @@ void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
   // publish odometry message
   Odometry odom;
   odom.header.frame_id = odom_frame_;
-  odom.header.stamp = state->header.stamp;
+  if (use_simtime_) {
+    odom.header.stamp = state->header.stamp;
+  } else {
+    odom.header.stamp = this->get_clock()->now();
+  }
   odom.child_frame_id = base_frame_;
 
   // Position
@@ -279,20 +297,18 @@ void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
     TransformStamped tf;
     tf.header.frame_id = odom_frame_;
     tf.child_frame_id = base_frame_;
-    tf.header.stamp = now();
+    if (use_simtime_) {
+      tf.header.stamp = state->header.stamp;
+    } else {
+      tf.header.stamp = this->get_clock()->now();
+    }
     tf.transform.translation.x = x_;
     tf.transform.translation.y = y_;
     tf.transform.translation.z = 0.0;
     tf.transform.rotation = odom.pose.pose.orientation;
-
-    if (rclcpp::ok()) {
-      tf_pub_->sendTransform(tf);
-    }
+    tf_pub_->sendTransform(tf);
   }
-
-  if (rclcpp::ok()) {
-    odom_pub_->publish(odom);
-  }
+  odom_pub_->publish(odom);
 }
 
 void VescToOdom::imuCallback(const Imu::SharedPtr imu)

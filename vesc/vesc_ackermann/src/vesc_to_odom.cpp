@@ -99,7 +99,7 @@ VescToOdom::VescToOdom(const rclcpp::NodeOptions & options)
   //   });
 
   // create odom publisher
-  odom_pub_ = create_publisher<Odometry>("odom_wheel_temp", 10);
+  odom_pub_ = create_publisher<Odometry>("odom_wheel", 10);
 
   // create tf broadcaster
   if (publish_tf_) {
